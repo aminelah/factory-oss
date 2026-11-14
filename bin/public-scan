@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Find instance data that leaked into the repo before it goes public.
+
+Reads every string in the factory state ($FACTORY_HOME, default ~/.factory, all
+.json and .jsonl files in all folders: roadmap titles, PR titles, ticket topics,
+project names, config values) and reports each one that also appears in a
+tracked file. A keyword list only catches the words someone thought of; this
+catches copied fixtures. Exits 1 when it finds any, 2 on a usage error.
+
+Not checked, so keep the keyword `git grep` for these:
+- text inside the code folders (factory/, template/, bin/, deploy/); text found
+  there is also dropped from the other files, since the code writes it into state;
+- strings under 16 characters or of one word (ids, slugs, names);
+- agent messages (inbox, relay, answers, autopilot, chatscan, agents-extra,
+  assign-pending): only their title, short, question, name and goal fields are
+  read, because their bodies quote the docs;
+- the secrets, site, site-public and protos folders, dot folders, and the skill
+  and token caches.
+
+A reviewed, harmless hit goes in .public-scan-ignore, copied exactly as printed.
+
+Usage: bin/public-scan [repo-dir]    (default: this checkout)
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+MIN_CHARS = 16
+SHINGLE = 5  # words; a shortened copy of a long title still shares a 5-word run
+CODE_DIRS = ("factory/", "template/", "bin/", "deploy/")
+SKIP_FILES = {"skills-cache.json", "tokens-cache.json"}  # skill and model names
+SKIP_DIRS = {"secrets", "site", "site-public", "protos"}
+# Agent prose quotes the docs: read only these keys there.
+PROSE_FILES = {"inbox.json", "relay.json", "answers.json", "autopilot.json", "chatscan.json",
+               "agents-extra.json", "assign-pending.json"}
+PROSE_KEYS = {"title", "short", "question", "name", "goal"}
+
+
+def strings(node, keys=None):
+    if isinstance(node, str):
+        if keys is None:
+            yield node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            if keys is None:
+                yield k
+            if keys is not None and k in keys:
+                yield from strings(v)
+            else:
+                yield from strings(v, keys)
+    elif isinstance(node, list):
+        for v in node:
+            yield from strings(v, keys)
+
+
+def state_strings(home):
+    for root, dirs, names in os.walk(home):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in names:
+            if name in SKIP_FILES or not name.endswith((".json", ".jsonl")):
+                continue
+            keys = PROSE_KEYS if name in PROSE_FILES else None
+            try:
+                with open(os.path.join(root, name)) as f:
+                    lines = f.read().splitlines() if name.endswith(".jsonl") else None
+                    docs = [] if lines is not None else [json.load(f)]
+            except (OSError, ValueError):
+                continue
+            for line in lines or []:
+                try:
+                    docs.append(json.loads(line))
+                except ValueError:
+                    continue  # a line cut off mid-append
+            for doc in docs:
+                yield from strings(doc, keys)
+
+
+def words(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def shingles(ws):
+    return {" ".join(ws[i:i + SHINGLE]) for i in range(len(ws) - SHINGLE + 1)}
+
+
+def main(argv):
+    repo = os.path.abspath(argv[1] if len(argv) > 1 else os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    home = os.environ.get("FACTORY_HOME") or os.path.expanduser("~/.factory")
+    ls = subprocess.run(["git", "-C", repo, "ls-files", "-z"], capture_output=True, text=True)
+    if ls.returncode:
+        print(f"not a git checkout: {repo}", file=sys.stderr)
+        return 2
+    if not os.path.isdir(home):
+        print(f"no state folder at {home}: nothing to compare", file=sys.stderr)
+        return 0
+    where = {}  # shingle -> first file holding it
+    short = {}  # each tracked file as one word string, for short state strings
+    for path in filter(None, ls.stdout.split("\0")):
+        if path == ".public-scan-ignore":
+            continue
+        try:
+            with open(os.path.join(repo, path), encoding="utf-8") as f:
+                ws = words(f.read())
+        except (OSError, UnicodeDecodeError):
+            continue
+        short[path] = " " + " ".join(ws) + " "
+        for s in shingles(ws):
+            where.setdefault(s, path)
+    for p in [p for p in short if p.startswith(CODE_DIRS)]:
+        for s in shingles(short.pop(p).split()):
+            where.pop(s, None)
+    blob = "\n".join(short.values())
+    hits = {}
+    for s in set(state_strings(home)):
+        ws = words(s)
+        if len(ws) >= SHINGLE:
+            for sh in shingles(ws):
+                if sh in where:
+                    hits.setdefault(sh, where[sh])
+        elif len(ws) >= 2 and len(" ".join(ws)) >= MIN_CHARS:
+            key = " " + " ".join(ws) + " "
+            if key in blob:
+                hits.setdefault(key.strip(), next(p for p, t in short.items() if key in t))
+    try:
+        with open(os.path.join(repo, ".public-scan-ignore")) as f:
+            ok = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+    except OSError:
+        ok = set()
+    hits = {t: p for t, p in hits.items() if t not in ok}
+    for text, path in sorted(hits.items(), key=lambda kv: (kv[1], kv[0])):
+        print(f"{path}: {text}")
+    print(f"{len(hits)} instance string(s) found in {repo}", file=sys.stderr)
+    return 1 if hits else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
